@@ -36,10 +36,30 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
 ]
 
-const MEDIA_CONSTRAINTS: MediaStreamConstraints = {   video: {
+interface ExtendedAudioConstraints extends MediaTrackConstraints {
+  latency?: ConstrainDouble;
+  echoCancellationType?: 'browser' | 'system';
+  suppressLocalAudioPlayback?: boolean;
+}
+
+const MEDIA_CONSTRAINTS: MediaStreamConstraints = {
+  video: {
     width: { ideal: 1280 },
     height: { ideal: 720 }
-  }, audio: true }
+  },
+  audio: {
+    sampleRate: { ideal: 48000 },
+    echoCancellation: { ideal: true },
+    autoGainControl: { ideal: true },
+    noiseSuppression: { ideal: true },
+    latency: { ideal: 0 },
+    echoCancellationType: 'system',
+    channelCount: { ideal: 2 },
+    deviceId: { exact: 'default' },
+    // suppressLocalAudioPlayback: true,
+    voiceIsolation:true,
+  } as ExtendedAudioConstraints
+};
 
 // The page is served over HTTPS by Vite, which proxies "/ws" to the Rust
 // signaling server. Using the same origin (wss + current host) means the
@@ -139,7 +159,12 @@ export function useWebRTC() {
   const startLocalMedia = useCallback(async (pc: RTCPeerConnection) => {
     const stream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS)
     stream.getTracks().forEach((track) => {
-      console.log(`%c[MEDIA] adding local ${track.kind} track`, 'color:#4f8cff')
+      console.groupCollapsed(`%c[MEDIA] adding local ${track.kind} track`, 'color:#4f8cff');
+
+      console.log('Constraints:', track.getConstraints());
+      console.log('Settings:', track.getSettings());
+      console.log('Capabilities:', track.getCapabilities?.());
+      console.groupEnd();
       pc.addTrack(track, stream)
     })
     localStreamRef.current = stream
