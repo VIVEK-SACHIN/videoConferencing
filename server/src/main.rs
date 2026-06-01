@@ -1,18 +1,27 @@
-//! Minimal WebRTC signaling server.
+//! Mesh WebRTC signaling server.
 //!
 //! WebRTC peers can't find each other on their own — they need a "signaling
 //! channel" to swap SDP offers/answers and ICE candidates before the direct
 //! peer-to-peer connection forms. This server is exactly that channel: a dumb
 //! relay. It never inspects the WebRTC payloads, it just shuttles them between
-//! the (at most two) peers sharing a room code.
+//! the peers sharing a room code.
+//!
+//! Topology is a full **mesh**: every participant opens a direct connection to
+//! every other participant, so the server's only job is identity + targeted
+//! routing. To stay glare-free, whoever is *already* in the room initiates the
+//! offer to each newcomer (the server processes joins one at a time under its
+//! mutex, giving a deterministic total order).
+//!
+//! Rooms are capped at 4 — mesh fan-out (each peer uploads its camera N-1
+//! times) makes larger groups impractical without an SFU.
 //!
 //! Protocol (JSON text frames):
-//!   client -> server : {"type":"join","room":"<code>"}
-//!   client -> server : {"type":"signal","data": <opaque>}   (relayed to the peer)
-//!   server -> client : {"type":"joined","peers":<n>}        (ack of your join)
-//!   server -> client : {"type":"peer-joined"}               (a peer joined AFTER you -> you initiate)
-//!   server -> client : {"type":"signal","data": <opaque>}   (relayed from the peer)
-//!   server -> client : {"type":"peer-left"}
+//!   client -> server : {"type":"join","room":"<code>","name":"<display>"}
+//!   client -> server : {"type":"signal","to":<peerId>,"data": <opaque>}
+//!   server -> client : {"type":"joined","you":<id>,"peers":[{"id":..,"name":..}]}
+//!   server -> client : {"type":"peer-joined","id":<id>,"name":<name>}  (you initiate to them)
+//!   server -> client : {"type":"signal","from":<id>,"data": <opaque>}  (relayed from a peer)
+//!   server -> client : {"type":"peer-left","id":<id>}
 //!   server -> client : {"type":"error","message":"<why>"}
 
 use axum::{
@@ -36,13 +45,22 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+/// Max participants per room. Mesh fan-out makes more than this impractical.
+const MAX_PEERS: usize = 4;
+
 /// Per-connection outbound message sender.
 type Tx = mpsc::UnboundedSender<Message>;
 
+/// What we track for each peer in a room: how to reach it + its display name.
+struct PeerInfo {
+    tx: Tx,
+    name: String,
+}
+
 #[derive(Default)]
 struct AppState {
-    /// room code -> { client id -> sender }
-    rooms: Mutex<HashMap<String, HashMap<usize, Tx>>>,
+    /// room code -> { client id -> peer info }
+    rooms: Mutex<HashMap<String, HashMap<usize, PeerInfo>>>,
     next_id: AtomicUsize,
 }
 
@@ -50,8 +68,9 @@ struct AppState {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum ClientMsg {
-    Join { room: String },
-    Signal { data: Value },
+    Join { room: String, name: String },
+    /// `to` is the id of the peer this signal is destined for.
+    Signal { to: usize, data: Value },
 }
 
 #[tokio::main]
@@ -60,7 +79,7 @@ async fn main() {
 
     let app = Router::new()
         // A plain GET so you can sanity-check the server is up in a browser.
-        .route("/", get(|| async { "WebRTC signaling server is running. Connect to /ws" }))
+        .route("/", get(|| async { "WebRTC mesh signaling server is running. Connect to /ws" }))
         .route("/ws", get(ws_handler))
         .with_state(state);
 
@@ -100,40 +119,56 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         };
 
         match serde_json::from_str::<ClientMsg>(&text) {
-            Ok(ClientMsg::Join { room }) => {
+            Ok(ClientMsg::Join { room, name }) => {
                 let mut rooms = state.rooms.lock().unwrap();
                 let peers = rooms.entry(room.clone()).or_default();
 
-                // Cap rooms at 2 for a 1:1 peer connection.
-                if peers.len() >= 2 {
+                // Cap the mesh size.
+                if peers.len() >= MAX_PEERS {
                     let _ = tx.send(text_frame(json!({"type":"error","message":"room is full"})));
                     continue;
                 }
 
+                // Snapshot the peers already here so the newcomer knows who to
+                // expect offers from.
+                let existing: Vec<Value> = peers
+                    .iter()
+                    .map(|(pid, info)| json!({"id": pid, "name": info.name}))
+                    .collect();
+
                 // Tell everyone already in the room that a new peer arrived.
-                // Whoever receives "peer-joined" becomes the offer initiator.
-                for peer_tx in peers.values() {
-                    let _ = peer_tx.send(text_frame(json!({"type":"peer-joined"})));
+                // Whoever receives "peer-joined" becomes the offer initiator
+                // toward this newcomer.
+                for info in peers.values() {
+                    let _ = info
+                        .tx
+                        .send(text_frame(json!({"type":"peer-joined","id":id,"name":name})));
                 }
 
-                peers.insert(id, tx.clone());
-                let count = peers.len();
+                peers.insert(
+                    id,
+                    PeerInfo {
+                        tx: tx.clone(),
+                        name: name.clone(),
+                    },
+                );
                 current_room = Some(room.clone());
                 drop(rooms);
 
-                let _ = tx.send(text_frame(json!({"type":"joined","peers":count})));
-                println!("client {id} joined room '{}' ({count} peer(s))", room);
+                let _ = tx.send(text_frame(
+                    json!({"type":"joined","you":id,"peers":existing}),
+                ));
+                println!("client {id} ('{name}') joined room '{room}'");
             }
 
-            Ok(ClientMsg::Signal { data }) => {
+            Ok(ClientMsg::Signal { to, data }) => {
                 if let Some(room) = &current_room {
                     let rooms = state.rooms.lock().unwrap();
                     if let Some(peers) = rooms.get(room) {
-                        let frame = text_frame(json!({"type":"signal","data":data}));
-                        for (peer_id, peer_tx) in peers.iter() {
-                            if *peer_id != id {
-                                let _ = peer_tx.send(frame.clone());
-                            }
+                        // Route only to the intended recipient, tagged with sender.
+                        if let Some(target) = peers.get(&to) {
+                            let frame = text_frame(json!({"type":"signal","from":id,"data":data}));
+                            let _ = target.tx.send(frame);
                         }
                     }
                 }
@@ -148,14 +183,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         let mut rooms = state.rooms.lock().unwrap();
         if let Some(peers) = rooms.get_mut(&room) {
             peers.remove(&id);
-            for peer_tx in peers.values() {
-                let _ = peer_tx.send(text_frame(json!({"type":"peer-left"})));
+            for info in peers.values() {
+                let _ = info.tx.send(text_frame(json!({"type":"peer-left","id":id})));
             }
             if peers.is_empty() {
                 rooms.remove(&room);
             }
         }
-        println!("client {id} left room '{}'", room);
+        println!("client {id} left room '{room}'");
     }
     send_task.abort();
 }

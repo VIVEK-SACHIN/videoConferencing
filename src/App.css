@@ -185,12 +185,94 @@ header h1 {
   background: #000;
   overflow: hidden;
 }
-.fs-remote {
+/* Space-filling grid of participants (self first). Tiles stay 16:9. */
+.fs-grid {
   position: absolute;
   inset: 0;
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  place-content: center;
+  place-items: center;
+  grid-auto-rows: 1fr;
+  transition: right 0.25s ease;
+}
+.fs-grid.chat-open {
+  right: 360px;
+}
+/* Column layout by participant count (max 4 in a mesh). */
+.fs-grid[data-count='1'] {
+  grid-template-columns: 1fr;
+}
+.fs-grid[data-count='2'] {
+  grid-template-columns: 1fr 1fr;
+}
+.fs-grid[data-count='3'],
+.fs-grid[data-count='4'] {
+  grid-template-columns: 1fr 1fr;
+}
+/* Odd one out (3 participants): the last tile spans both columns but is
+   constrained to one column's width and centred on the second row. */
+.fs-grid[data-count='3'] .tile:nth-child(3) {
+  grid-column: 1 / -1;
+  max-width: calc(50% - 4px);
+}
+.tile {
+  position: relative;
   width: 100%;
   height: 100%;
-  object-fit: contain; /* fill the viewport */
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 16 / 9;
+  margin: auto;
+  background: #000;
+  border-radius: 12px;
+  overflow: hidden;
+}
+.tile-video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain; /* show the whole frame, letterboxed */
+  background: #000;
+}
+.tile-video-mirror {
+  transform: scaleX(-1); /* mirror own camera */
+}
+/* Camera-off placeholder: UI-toned backdrop + circular initials avatar. */
+.tile-avatar {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #1a1f2b, #11141b);
+}
+.avatar-circle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30%;
+  max-width: 110px;
+  min-width: 52px;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  color: #fff;
+  font-weight: 600;
+  font-size: clamp(1.1rem, 3vw, 2.4rem);
+  letter-spacing: 0.04em;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+}
+.tile-label {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  padding: 2px 8px;
+  font-size: 0.8rem;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
 }
 .fs-waiting {
   position: absolute;
@@ -219,25 +301,6 @@ header h1 {
   text-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
 }
 
-.fs-local {
-  position: absolute;
-  bottom: 6.5rem;
-  right: 1.25rem;
-  width: 220px;
-  max-width: 26vw;
-  aspect-ratio: 4 / 3;
-  object-fit: cover;
-  border-radius: 12px;
-  border: 2px solid rgba(255, 255, 255, 0.2);
-  background: #111;
-  transform: scaleX(-1); /* mirror local preview */
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.55);
-  z-index: 4;
-  transition: right 0.25s ease;
-}
-.fs-local-shifted {
-  right: calc(360px + 1.25rem);
-}
 
 .fs-controls {
   position: absolute;
@@ -347,9 +410,16 @@ header h1 {
 }
 .msg {
   display: flex;
+  flex-direction: column;
+  align-items: flex-start;
 }
 .msg-me {
-  justify-content: flex-end;
+  align-items: flex-end;
+}
+.msg-name {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin: 0 0 2px 0.4rem;
 }
 .bubble {
   max-width: 75%;

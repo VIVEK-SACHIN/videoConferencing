@@ -4,10 +4,10 @@ import './App.css'
 
 const STATUS_LABEL: Record<Status, string> = {
   idle: 'Not connected',
-  waiting: 'Waiting for peer…',
+  waiting: 'Waiting for others…',
   connecting: 'Connecting…',
   connected: 'Connected',
-  disconnected: 'Peer disconnected',
+  disconnected: 'Disconnected',
   failed: 'Failed',
 }
 
@@ -30,6 +30,33 @@ function Video({
   return <video ref={ref} className={className} autoPlay playsInline muted={muted} />
 }
 
+// Initials for the camera-off avatar: first letters of the first two words,
+// or the first two letters of a single-word name.
+function initials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return '?'
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase()
+  return (parts[0][0] + parts[1][0]).toUpperCase()
+}
+
+// Deterministic hue from a name so each person gets a stable avatar colour.
+function avatarHue(name: string): number {
+  let h = 0
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360
+  return h
+}
+
+/** Shown over a tile when that participant's camera is off. */
+function Avatar({ name }: { name: string }) {
+  return (
+    <div className="tile-avatar">
+      <div className="avatar-circle" style={{ background: `hsl(${avatarHue(name)} 55% 45%)` }}>
+        {initials(name)}
+      </div>
+    </div>
+  )
+}
+
 // A short, easy-to-share room code. Avoids ambiguous characters.
 function randomRoom(): string {
   const chars = 'abcdefghjkmnpqrstuvwxyz23456789'
@@ -42,6 +69,7 @@ export default function App() {
   const rtc = useWebRTC()
   // Prefill the room from the URL hash so sharing a link "just works".
   const [roomInput, setRoomInput] = useState(() => location.hash.slice(1) || randomRoom())
+  const [nameInput, setNameInput] = useState('')
   const [draft, setDraft] = useState('')
   const [chatOpen, setChatOpen] = useState(false)
   const [seenCount, setSeenCount] = useState(0)
@@ -62,9 +90,10 @@ export default function App() {
 
   function join() {
     const code = roomInput.trim()
-    if (!code) return
+    const name = nameInput.trim()
+    if (!code || !name) return
     location.hash = code
-    rtc.joinRoom(code)
+    rtc.joinRoom(code, name)
   }
 
   function send(e: React.FormEvent) {
@@ -76,27 +105,38 @@ export default function App() {
   }
 
   const shareUrl = `${location.origin}/#${rtc.room}`
+  const canJoin = roomInput.trim() !== '' && nameInput.trim() !== ''
 
   return (
     <div className={inCall ? 'app app-incall' : 'app'}>
       {!inCall && (
         <header>
-          <h1>WebRTC P2P Call</h1>
+          <h1>WebRTC Mesh Conference</h1>
           <span className={`status status-${rtc.status}`}>{STATUS_LABEL[rtc.status]}</span>
         </header>
       )}
 
       {rtc.error && !inCall && <div className="error">⚠ {rtc.error}</div>}
 
-      {/* LOBBY — pick/enter a room code */}
+      {/* LOBBY — pick a name + room code */}
       {rtc.status === 'idle' && (
         <div className="setup">
           <div className="role-pick">
             <p>
-              Enter a room code and share it (or the link) with one other person. When you both
-              join the same room, the call connects automatically — no copy-paste. Your browser
-              will ask for camera + mic permission.
+              Enter your name and a room code, then share the code (or link) with up to 3 other
+              people. Everyone who joins the same room connects in a peer-to-peer mesh — no copy-paste.
+              Your browser will ask for camera + mic permission.
             </p>
+            <div className="join-row">
+              <input
+                value={nameInput}
+                onChange={(e) => setNameInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && join()}
+                placeholder="your name"
+                spellCheck={false}
+                autoFocus
+              />
+            </div>
             <div className="join-row">
               <input
                 value={roomInput}
@@ -108,7 +148,7 @@ export default function App() {
               <button onClick={() => setRoomInput(randomRoom())} title="New random code">
                 🎲
               </button>
-              <button className="primary" onClick={join}>
+              <button className="primary" onClick={join} disabled={!canJoin}>
                 Join room
               </button>
             </div>
@@ -122,13 +162,13 @@ export default function App() {
           <div className="waiting">
             <p>
               Room <code className="roomcode">{rtc.room}</code> —{' '}
-              {rtc.status === 'connecting' ? 'connecting to peer…' : 'waiting for someone to join.'}
+              {rtc.status === 'connecting' ? 'connecting to peers…' : 'waiting for others to join.'}
             </p>
             <ShareBox url={shareUrl} />
             {rtc.localStream && (
               <div className="preview">
                 <Video stream={rtc.localStream} muted className="preview-video" />
-                <span className="preview-label">Your camera</span>
+                <span className="preview-label">{rtc.myName} (you)</span>
               </div>
             )}
             <button className="link" onClick={rtc.leaveRoom}>
@@ -138,8 +178,8 @@ export default function App() {
         </div>
       )}
 
-      {/* DISCONNECTED / FAILED */}
-      {(rtc.status === 'disconnected' || rtc.status === 'failed') && (
+      {/* FAILED */}
+      {rtc.status === 'failed' && (
         <div className="setup">
           <button className="primary" onClick={rtc.leaveRoom}>
             Back to lobby
@@ -147,25 +187,36 @@ export default function App() {
         </div>
       )}
 
-      {/* IN CALL — full-viewport video with floating controls + slide-in chat */}
+      {/* IN CALL — grid of remote participants + floating controls + slide-in chat */}
       {inCall && (
         <div className="fscall">
-          {/* Remote video fills the whole screen */}
-          <Video stream={rtc.remoteStream} className="fs-remote" />
-          {!rtc.remoteStream && <p className="hint fs-waiting">Waiting for peer's video…</p>}
+          {/* All participants (self first) in one space-filling 16:9 grid */}
+          <div
+            className={chatOpen ? 'fs-grid chat-open' : 'fs-grid'}
+            data-count={rtc.remotePeers.length + 1}
+          >
+            {/* Self tile, always first */}
+            <div className="tile">
+              <Video stream={rtc.localStream} muted className="tile-video tile-video-mirror" />
+              {!rtc.cameraOn && <Avatar name={rtc.myName} />}
+              <span className="tile-label">{rtc.myName} (you)</span>
+            </div>
+            {rtc.remotePeers.map((peer) => (
+              <div className="tile" key={peer.id}>
+                <Video stream={peer.stream} className="tile-video" />
+                {!peer.videoOn && <Avatar name={peer.name} />}
+                <span className="tile-label">{peer.name}</span>
+              </div>
+            ))}
+          </div>
 
           {/* Top gradient bar with title + status */}
           <div className="fs-topbar">
             <span className="fs-title">Room {rtc.room}</span>
-            <span className="status status-connected">Connected</span>
+            <span className="status status-connected">
+              {rtc.remotePeers.length + 1} in call
+            </span>
           </div>
-
-          {/* Local camera, picture-in-picture (shifts left when chat is open) */}
-          <Video
-            stream={rtc.localStream}
-            muted
-            className={chatOpen ? 'fs-local fs-local-shifted' : 'fs-local'}
-          />
 
           {/* Floating control bar */}
           <div className="fs-controls">
@@ -199,9 +250,10 @@ export default function App() {
               </button>
             </div>
             <div className="messages">
-              {rtc.messages.length === 0 && <p className="hint">Chat over the data channel 👋</p>}
+              {rtc.messages.length === 0 && <p className="hint">Chat with the whole room 👋</p>}
               {rtc.messages.map((m) => (
                 <div key={m.id} className={`msg msg-${m.from}`}>
+                  {m.from === 'peer' && m.name && <span className="msg-name">{m.name}</span>}
                   <span className="bubble">{m.text}</span>
                 </div>
               ))}
