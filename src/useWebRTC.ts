@@ -1,22 +1,18 @@
 import { useCallback, useRef, useState } from 'react'
 
 /**
- * A WebRTC peer-to-peer chat hook using *manual* (copy-paste) signaling.
+ * WebRTC peer-to-peer call hook using a WebSocket signaling server.
  *
- * WebRTC needs a "signaling channel" to exchange two things before a direct
- * connection can form:
- *   1. Session descriptions (SDP) — the offer/answer describing media + transport.
- *   2. ICE candidates — the network routes (IP:port pairs) each peer can be reached on.
+ * Instead of copy-pasting SDP by hand, both peers join a room on the Rust
+ * signaling server (proxied at /ws). The server relays messages between the two
+ * peers in a room so they can exchange:
+ *   1. SDP offer/answer — describing media + transport.
+ *   2. ICE candidates — network routes, sent incrementally ("trickle ICE")
+ *      as the browser discovers them, instead of waiting for all of them.
  *
- * Normally a server relays these. Here we skip the server entirely: we wait for
- * ICE gathering to finish so every candidate is baked into the SDP, then encode
- * the whole description as one base64 blob you copy/paste between the two peers.
- *
- * Flow:
- *   Peer A (caller):  createOffer()  -> copy blob -> send to B
- *   Peer B (callee):  acceptOffer(blobFromA) -> copy answer blob -> send back to A
- *   Peer A (caller):  acceptAnswer(blobFromB)
- *   ...data channel opens, chat flows directly between browsers.
+ * Role assignment: whoever is *already* in the room when a second peer joins
+ * receives "peer-joined" and becomes the offer initiator. The newcomer waits
+ * for the offer. This gives a deterministic caller/callee split (no glare).
  */
 
 export type ChatMessage = {
@@ -26,14 +22,10 @@ export type ChatMessage = {
   at: number
 }
 
-export type Role = 'none' | 'caller' | 'callee'
-
 export type Status =
   | 'idle'
-  | 'creating-offer'
-  | 'awaiting-answer'
-  | 'creating-answer'
-  | 'connecting'
+  | 'waiting' // in a room, waiting for the other peer
+  | 'connecting' // negotiating offer/answer/ICE
   | 'connected'
   | 'disconnected'
   | 'failed'
@@ -44,82 +36,17 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
 ]
 
-// Encode/decode an SDP description as a compact, copy-paste-friendly string.
-function encodeSignal(desc: RTCSessionDescription): string {
-  // Log the full session description so you can read the raw SDP in the console.
-  console.groupCollapsed(`%c[SDP] local ${desc.type}`, 'color:#4f8cff;font-weight:bold')
-  console.log(desc.sdp)
-  console.groupEnd()
-  return btoa(JSON.stringify({ type: desc.type, sdp: desc.sdp }))
-}
+const MEDIA_CONSTRAINTS: MediaStreamConstraints = {   video: {
+    width: { ideal: 1280 },
+    height: { ideal: 720 }
+  }, audio: true }
 
-function decodeSignal(blob: string): RTCSessionDescriptionInit {
-  const parsed = JSON.parse(atob(blob.trim()))
-  console.groupCollapsed(`%c[SDP] remote ${parsed.type}`, 'color:#a06bff;font-weight:bold')
-  console.log(parsed.sdp)
-  console.groupEnd()
-  if (!parsed.type || !parsed.sdp) throw new Error('Not a valid signal blob')
-  return parsed as RTCSessionDescriptionInit
-}
-
-// Resolve once ICE gathering finishes, so the local description contains all
-// candidates inline (non-trickle ICE). This is what makes single-blob copy-paste work.
-//
-// Along the way we log every ICE candidate as the browser discovers it, plus
-// the gathering-state transitions, so you can watch the process live.
-function waitForIceGathering(pc: RTCPeerConnection): Promise<void> {
-  console.log(
-    `%c[ICE] gathering started (state: ${pc.iceGatheringState})`,
-    'color:#ffd27a;font-weight:bold',
-  )
-
-  let count = 0
-  const onCandidate = (e: RTCPeerConnectionIceEvent) => {
-    if (e.candidate) {
-      count++
-      // The .candidate string is the raw SDP line; the parsed fields tell you
-      // the candidate type (host / srflx = STUN-reflexive / relay = TURN).
-      const c = e.candidate
-      console.log(
-        `%c[ICE] candidate #${count}`,
-        'color:#6ee7a8',
-        `${c.type ?? '?'} ${c.protocol ?? ''} ${c.address ?? ''}:${c.port ?? ''}`,
-        '\n  ' + c.candidate,
-      )
-    } else {
-      // A null candidate signals the end of gathering.
-      console.log('%c[ICE] end-of-candidates (null)', 'color:#9aa3b2')
-    }
-  }
-  pc.addEventListener('icecandidate', onCandidate)
-
-  if (pc.iceGatheringState === 'complete') {
-    pc.removeEventListener('icecandidate', onCandidate)
-    console.log('%c[ICE] already complete', 'color:#ffd27a;font-weight:bold')
-    return Promise.resolve()
-  }
-
-  return new Promise((resolve) => {
-    function finish(reason: string) {
-      pc.removeEventListener('icegatheringstatechange', check)
-      pc.removeEventListener('icecandidate', onCandidate)
-      console.log(
-        `%c[ICE] gathering done (${reason}) — ${count} candidate(s)`,
-        'color:#ffd27a;font-weight:bold',
-      )
-      resolve()
-    }
-    function check() {
-      console.log(`%c[ICE] gathering state: ${pc.iceGatheringState}`, 'color:#9aa3b2')
-      if (pc.iceGatheringState === 'complete') finish('complete')
-    }
-    pc.addEventListener('icegatheringstatechange', check)
-    // Safety net: some browsers can stall; give up gathering after 3s and
-    // proceed with whatever candidates we have.
-    setTimeout(() => {
-      if (pc.iceGatheringState !== 'complete') finish('timeout 3s')
-    }, 3000)
-  })
+// The page is served over HTTPS by Vite, which proxies "/ws" to the Rust
+// signaling server. Using the same origin (wss + current host) means the
+// browser reuses the TLS cert it already trusts — no extra cert prompt.
+function signalingUrl(): string {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  return `${proto}://${location.host}/ws`
 }
 
 let messageCounter = 0
@@ -127,21 +54,42 @@ function newMessageId(): string {
   return `${Date.now()}-${messageCounter++}`
 }
 
+// Signal payloads we send through the relay (wrapped in {type:'signal',data:...}).
+type SdpSignal = { kind: 'sdp'; description: RTCSessionDescriptionInit }
+type IceSignal = { kind: 'ice'; candidate: RTCIceCandidateInit }
+type Signal = SdpSignal | IceSignal
+
 export function useWebRTC() {
-  const [role, setRole] = useState<Role>('none')
   const [status, setStatus] = useState<Status>('idle')
-  const [localSignal, setLocalSignal] = useState('')
+  const [room, setRoom] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null)
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
+  const [micOn, setMicOn] = useState(true)
+  const [cameraOn, setCameraOn] = useState(true)
 
   const pcRef = useRef<RTCPeerConnection | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
   const channelRef = useRef<RTCDataChannel | null>(null)
+  const localStreamRef = useRef<MediaStream | null>(null)
+  // ICE candidates that arrive before we've set the remote description must be
+  // queued, then applied once setRemoteDescription succeeds.
+  const pendingCandidates = useRef<RTCIceCandidateInit[]>([])
 
   const addMessage = useCallback((text: string, from: 'me' | 'peer') => {
     setMessages((prev) => [...prev, { id: newMessageId(), text, from, at: Date.now() }])
   }, [])
 
-  // Wire up a data channel (created by us, or received via ondatachannel).
+  // Send a signaling payload to the peer via the relay.
+  const sendSignal = useCallback((signal: Signal) => {
+    const ws = wsRef.current
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'signal', data: signal }))
+    }
+  }, [])
+
+  // Wire up a data channel (created by the initiator, or received by the other).
   const setupChannel = useCallback(
     (channel: RTCDataChannel) => {
       channelRef.current = channel
@@ -155,6 +103,16 @@ export function useWebRTC() {
   const createPeerConnection = useCallback(() => {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
 
+    // Trickle ICE: ship each candidate to the peer the moment it's found.
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        console.log('%c[ICE] local candidate → peer', 'color:#6ee7a8', e.candidate.candidate)
+        sendSignal({ kind: 'ice', candidate: e.candidate.toJSON() })
+      } else {
+        console.log('%c[ICE] gathering complete', 'color:#ffd27a;font-weight:bold')
+      }
+    }
+
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState
       console.log(`%c[PC] connection state: ${s}`, 'color:#4f8cff;font-weight:bold')
@@ -164,80 +122,143 @@ export function useWebRTC() {
       else if (s === 'failed') setStatus('failed')
     }
 
-    // The callee learns about the channel here (the caller created it).
+    // Remote audio + video tracks share one MediaStream.
+    pc.ontrack = (e) => {
+      console.log(`%c[MEDIA] remote ${e.track.kind} track received`, 'color:#6ee7a8;font-weight:bold')
+      setRemoteStream(e.streams[0])
+    }
+
+    // The non-initiator learns about the data channel here.
     pc.ondatachannel = (e) => setupChannel(e.channel)
 
     pcRef.current = pc
     return pc
-  }, [setupChannel])
+  }, [sendSignal, setupChannel])
 
-  // --- Caller: step 1 ---
-  const createOffer = useCallback(async () => {
-    try {
-      setError(null)
-      setRole('caller')
-      setStatus('creating-offer')
-      const pc = createPeerConnection()
-
-      // Caller proactively creates the data channel.
-      const channel = pc.createDataChannel('chat')
-      setupChannel(channel)
-
-      const offer = await pc.createOffer()
-      await pc.setLocalDescription(offer)
-      await waitForIceGathering(pc)
-
-      setLocalSignal(encodeSignal(pc.localDescription!))
-      setStatus('awaiting-answer')
-    } catch (err) {
-      setError((err as Error).message)
-      setStatus('failed')
-    }
-  }, [createPeerConnection, setupChannel])
-
-  // --- Callee: switch into the "join" view before pasting the offer ---
-  const joinAsCallee = useCallback(() => {
-    setError(null)
-    setRole('callee')
-    setStatus('idle')
+  // Grab camera + mic and attach every track BEFORE creating any offer/answer.
+  const startLocalMedia = useCallback(async (pc: RTCPeerConnection) => {
+    const stream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS)
+    stream.getTracks().forEach((track) => {
+      console.log(`%c[MEDIA] adding local ${track.kind} track`, 'color:#4f8cff')
+      pc.addTrack(track, stream)
+    })
+    localStreamRef.current = stream
+    setLocalStream(stream)
+    setMicOn(true)
+    setCameraOn(true)
   }, [])
 
-  // --- Callee: step 1 (takes the caller's offer blob) ---
-  const acceptOffer = useCallback(
-    async (offerBlob: string) => {
+  const flushCandidates = useCallback(async (pc: RTCPeerConnection) => {
+    for (const candidate of pendingCandidates.current) {
+      try {
+        await pc.addIceCandidate(candidate)
+      } catch (err) {
+        console.warn('[ICE] failed to add queued candidate', err)
+      }
+    }
+    pendingCandidates.current = []
+  }, [])
+
+  // Handle a signaling payload relayed from the peer.
+  const handleSignal = useCallback(
+    async (signal: Signal) => {
+      const pc = pcRef.current
+      if (!pc) return
+
+      if (signal.kind === 'sdp') {
+        console.log(`%c[SDP] remote ${signal.description.type}`, 'color:#a06bff;font-weight:bold')
+        await pc.setRemoteDescription(signal.description)
+        await flushCandidates(pc)
+
+        // If we received an offer, answer it.
+        if (signal.description.type === 'offer') {
+          const answer = await pc.createAnswer()
+          await pc.setLocalDescription(answer)
+          console.log('%c[SDP] local answer → peer', 'color:#4f8cff;font-weight:bold')
+          sendSignal({ kind: 'sdp', description: { type: answer.type, sdp: answer.sdp } })
+        }
+      } else if (signal.kind === 'ice') {
+        // Can only add a candidate after the remote description exists.
+        if (pc.remoteDescription) {
+          try {
+            await pc.addIceCandidate(signal.candidate)
+          } catch (err) {
+            console.warn('[ICE] failed to add candidate', err)
+          }
+        } else {
+          pendingCandidates.current.push(signal.candidate)
+        }
+      }
+    },
+    [flushCandidates, sendSignal],
+  )
+
+  const joinRoom = useCallback(
+    async (roomId: string) => {
+      const code = roomId.trim()
+      if (!code) return
       try {
         setError(null)
-        setRole('callee')
-        setStatus('creating-answer')
+        setRoom(code)
+        setMessages([])
+        setStatus('waiting')
+
         const pc = createPeerConnection()
+        // Capture media up front so tracks are present before negotiation.
+        await startLocalMedia(pc)
 
-        await pc.setRemoteDescription(decodeSignal(offerBlob))
-        const answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-        await waitForIceGathering(pc)
+        const ws = new WebSocket(signalingUrl())
+        wsRef.current = ws
 
-        setLocalSignal(encodeSignal(pc.localDescription!))
+        ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room: code }))
+
+        ws.onmessage = async (ev) => {
+          const msg = JSON.parse(ev.data)
+          switch (msg.type) {
+            case 'joined':
+              console.log(`%c[SIGNAL] joined room '${code}' (${msg.peers} peer(s))`, 'color:#9aa3b2')
+              break
+
+            case 'peer-joined': {
+              // We were here first → we initiate. Create the data channel + offer.
+              console.log('%c[SIGNAL] peer joined — initiating offer', 'color:#4f8cff;font-weight:bold')
+              setStatus('connecting')
+              const channel = pc.createDataChannel('chat')
+              setupChannel(channel)
+              const offer = await pc.createOffer()
+              await pc.setLocalDescription(offer)
+              sendSignal({ kind: 'sdp', description: { type: offer.type, sdp: offer.sdp } })
+              break
+            }
+
+            case 'signal':
+              setStatus('connecting')
+              await handleSignal(msg.data as Signal)
+              break
+
+            case 'peer-left':
+              console.log('%c[SIGNAL] peer left', 'color:#ff8a8a')
+              setStatus('disconnected')
+              break
+
+            case 'error':
+              setError(msg.message ?? 'Signaling error')
+              setStatus('failed')
+              break
+          }
+        }
+
+        ws.onerror = () => {
+          setError('Could not reach the signaling server. Is it running on port 9000?')
+          setStatus('failed')
+        }
       } catch (err) {
         setError((err as Error).message)
         setStatus('failed')
       }
     },
-    [createPeerConnection],
+    [createPeerConnection, startLocalMedia, setupChannel, sendSignal, handleSignal],
   )
-
-  // --- Caller: step 2 (takes the callee's answer blob) ---
-  const acceptAnswer = useCallback(async (answerBlob: string) => {
-    try {
-      setError(null)
-      const pc = pcRef.current
-      if (!pc) throw new Error('No active connection — create an offer first')
-      setStatus('connecting')
-      await pc.setRemoteDescription(decodeSignal(answerBlob))
-    } catch (err) {
-      setError((err as Error).message)
-      setStatus('failed')
-    }
-  }, [])
 
   const sendMessage = useCallback(
     (text: string) => {
@@ -249,29 +270,55 @@ export function useWebRTC() {
     [addMessage],
   )
 
-  const reset = useCallback(() => {
+  const toggleMic = useCallback(() => {
+    const stream = localStreamRef.current
+    if (!stream) return
+    const next = !micOn
+    stream.getAudioTracks().forEach((t) => (t.enabled = next))
+    setMicOn(next)
+  }, [micOn])
+
+  const toggleCamera = useCallback(() => {
+    const stream = localStreamRef.current
+    if (!stream) return
+    const next = !cameraOn
+    stream.getVideoTracks().forEach((t) => (t.enabled = next))
+    setCameraOn(next)
+  }, [cameraOn])
+
+  const leaveRoom = useCallback(() => {
+    localStreamRef.current?.getTracks().forEach((t) => t.stop())
     channelRef.current?.close()
     pcRef.current?.close()
+    wsRef.current?.close()
     channelRef.current = null
     pcRef.current = null
-    setRole('none')
+    wsRef.current = null
+    localStreamRef.current = null
+    pendingCandidates.current = []
     setStatus('idle')
-    setLocalSignal('')
+    setRoom('')
     setMessages([])
     setError(null)
+    setLocalStream(null)
+    setRemoteStream(null)
+    setMicOn(true)
+    setCameraOn(true)
   }, [])
 
   return {
-    role,
     status,
-    localSignal,
+    room,
     messages,
     error,
-    createOffer,
-    joinAsCallee,
-    acceptOffer,
-    acceptAnswer,
+    localStream,
+    remoteStream,
+    micOn,
+    cameraOn,
+    joinRoom,
     sendMessage,
-    reset,
+    toggleMic,
+    toggleCamera,
+    leaveRoom,
   }
 }
