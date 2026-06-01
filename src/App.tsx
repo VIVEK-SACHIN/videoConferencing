@@ -1,7 +1,6 @@
 import { useWebRTC, type Status } from './webrtc'
 import { CallView } from './components/CallView'
 import { Lobby } from './components/Lobby'
-import { WaitingRoom } from './components/WaitingRoom'
 import './App.css'
 
 const STATUS_LABEL: Record<Status, string> = {
@@ -15,7 +14,8 @@ const STATUS_LABEL: Record<Status, string> = {
 
 export default function App() {
   const rtc = useWebRTC()
-  const inCall = rtc.status === 'connected'
+  // Once you're in a room you're in the meeting — even alone, with just your
+  // own tile filling the grid. No separate waiting/green-room screen.
   const inRoom = rtc.status !== 'idle' && rtc.status !== 'failed'
 
   function handleJoin(room: string, name: string) {
@@ -23,8 +23,8 @@ export default function App() {
     rtc.joinRoom(room, name)
   }
 
-  // In-call is a full-viewport experience with its own chrome.
-  if (inCall) return <CallView rtc={rtc} />
+  // The meeting is a full-viewport experience with its own chrome.
+  if (inRoom) return <CallView rtc={rtc} />
 
   return (
     <div className="app">
@@ -36,16 +36,6 @@ export default function App() {
       {rtc.error && <div className="error">⚠ {rtc.error}</div>}
 
       {rtc.status === 'idle' && <Lobby onJoin={handleJoin} />}
-
-      {inRoom && (
-        <WaitingRoom
-          room={rtc.room}
-          myName={rtc.myName}
-          status={rtc.status}
-          localStream={rtc.localStream}
-          onLeave={rtc.leaveRoom}
-        />
-      )}
 
       {rtc.status === 'failed' && (
         <div className="setup">

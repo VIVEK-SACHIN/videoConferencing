@@ -294,6 +294,26 @@ header h1 {
   font-weight: 600;
   text-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
 }
+.fs-topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+/* The top bar ignores pointer events so it doesn't block the video; re-enable
+   them on the interactive invite button. */
+.invite-btn {
+  pointer-events: auto;
+  border-radius: 999px;
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(12px);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+.invite-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.22);
+  border-color: transparent;
+}
 
 
 .fs-controls {

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { UseWebRTC } from '../webrtc'
 import { ChatPanel } from './ChatPanel'
 import { Controls } from './Controls'
+import { InviteButton } from './InviteButton'
 import { VideoGrid } from './VideoGrid'
 
 /** The in-call experience: participant grid, top bar, controls, and chat. */
@@ -27,7 +28,14 @@ export function CallView({ rtc }: { rtc: UseWebRTC }) {
 
       <div className="fs-topbar">
         <span className="fs-title">Room {rtc.room}</span>
-        <span className="status status-connected">{rtc.remotePeers.length + 1} in call</span>
+        <div className="fs-topbar-right">
+          <span className="status status-connected">
+            {rtc.remotePeers.length === 0
+              ? 'Waiting for others…'
+              : `${rtc.remotePeers.length + 1} in call`}
+          </span>
+          <InviteButton room={rtc.room} />
+        </div>
       </div>
 
       <Controls
