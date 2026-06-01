@@ -46,34 +46,78 @@ const ICE_SERVERS: RTCIceServer[] = [
 
 // Encode/decode an SDP description as a compact, copy-paste-friendly string.
 function encodeSignal(desc: RTCSessionDescription): string {
-  console.log
+  // Log the full session description so you can read the raw SDP in the console.
+  console.groupCollapsed(`%c[SDP] local ${desc.type}`, 'color:#4f8cff;font-weight:bold')
+  console.log(desc.sdp)
+  console.groupEnd()
   return btoa(JSON.stringify({ type: desc.type, sdp: desc.sdp }))
 }
 
 function decodeSignal(blob: string): RTCSessionDescriptionInit {
   const parsed = JSON.parse(atob(blob.trim()))
-  console.log('parsed:', parsed)
+  console.groupCollapsed(`%c[SDP] remote ${parsed.type}`, 'color:#a06bff;font-weight:bold')
+  console.log(parsed.sdp)
+  console.groupEnd()
   if (!parsed.type || !parsed.sdp) throw new Error('Not a valid signal blob')
   return parsed as RTCSessionDescriptionInit
 }
 
 // Resolve once ICE gathering finishes, so the local description contains all
 // candidates inline (non-trickle ICE). This is what makes single-blob copy-paste work.
+//
+// Along the way we log every ICE candidate as the browser discovers it, plus
+// the gathering-state transitions, so you can watch the process live.
 function waitForIceGathering(pc: RTCPeerConnection): Promise<void> {
-  if (pc.iceGatheringState === 'complete') return Promise.resolve()
+  console.log(
+    `%c[ICE] gathering started (state: ${pc.iceGatheringState})`,
+    'color:#ffd27a;font-weight:bold',
+  )
+
+  let count = 0
+  const onCandidate = (e: RTCPeerConnectionIceEvent) => {
+    if (e.candidate) {
+      count++
+      // The .candidate string is the raw SDP line; the parsed fields tell you
+      // the candidate type (host / srflx = STUN-reflexive / relay = TURN).
+      const c = e.candidate
+      console.log(
+        `%c[ICE] candidate #${count}`,
+        'color:#6ee7a8',
+        `${c.type ?? '?'} ${c.protocol ?? ''} ${c.address ?? ''}:${c.port ?? ''}`,
+        '\n  ' + c.candidate,
+      )
+    } else {
+      // A null candidate signals the end of gathering.
+      console.log('%c[ICE] end-of-candidates (null)', 'color:#9aa3b2')
+    }
+  }
+  pc.addEventListener('icecandidate', onCandidate)
+
+  if (pc.iceGatheringState === 'complete') {
+    pc.removeEventListener('icecandidate', onCandidate)
+    console.log('%c[ICE] already complete', 'color:#ffd27a;font-weight:bold')
+    return Promise.resolve()
+  }
+
   return new Promise((resolve) => {
+    function finish(reason: string) {
+      pc.removeEventListener('icegatheringstatechange', check)
+      pc.removeEventListener('icecandidate', onCandidate)
+      console.log(
+        `%c[ICE] gathering done (${reason}) — ${count} candidate(s)`,
+        'color:#ffd27a;font-weight:bold',
+      )
+      resolve()
+    }
     function check() {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', check)
-        resolve()
-      }
+      console.log(`%c[ICE] gathering state: ${pc.iceGatheringState}`, 'color:#9aa3b2')
+      if (pc.iceGatheringState === 'complete') finish('complete')
     }
     pc.addEventListener('icegatheringstatechange', check)
     // Safety net: some browsers can stall; give up gathering after 3s and
     // proceed with whatever candidates we have.
     setTimeout(() => {
-      pc.removeEventListener('icegatheringstatechange', check)
-      resolve()
+      if (pc.iceGatheringState !== 'complete') finish('timeout 3s')
     }, 3000)
   })
 }
@@ -113,6 +157,7 @@ export function useWebRTC() {
 
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState
+      console.log(`%c[PC] connection state: ${s}`, 'color:#4f8cff;font-weight:bold')
       if (s === 'connecting') setStatus('connecting')
       else if (s === 'connected') setStatus('connected')
       else if (s === 'disconnected' || s === 'closed') setStatus('disconnected')
