@@ -1,0 +1,403 @@
+import { ICE_SERVERS, MEDIA_CONSTRAINTS, signalingUrl } from './config'
+import { preferH264 } from './codec'
+import type { ChatMessage, RemotePeer, Signal, Status } from './types'
+
+/**
+ * Framework-agnostic WebRTC **mesh** client.
+ *
+ * Every participant holds a direct RTCPeerConnection to every *other*
+ * participant (a full mesh). The Rust signaling server (proxied at /ws) is a
+ * dumb, identity-aware relay: it assigns each peer an id, tells newcomers who's
+ * already in the room, and routes each SDP/ICE message to one specific peer.
+ *
+ * Role assignment (glare-free): whoever is *already* in the room when someone
+ * joins receives "peer-joined" and becomes the offer initiator toward that
+ * newcomer. The newcomer waits for offers. Because the server processes joins
+ * one at a time, every pair has exactly one deterministic initiator.
+ *
+ * This class owns no React state — it emits a fresh immutable snapshot through
+ * `onChange` whenever anything observable changes. A hook (or any UI) can
+ * subscribe to render.
+ */
+
+// Everything we track per remote peer in the mesh.
+type Peer = {
+  pc: RTCPeerConnection
+  channel: RTCDataChannel | null
+  // ICE candidates that arrive before setRemoteDescription must be queued.
+  pending: RTCIceCandidateInit[]
+  name: string
+  // Whether the peer is currently sending live video (camera on).
+  videoOn: boolean
+}
+
+/** A PeerConnection augmented with the remote stream captured from `ontrack`. */
+type PcWithStream = RTCPeerConnection & { _remoteStream?: MediaStream }
+
+/** The observable snapshot the UI renders from. */
+export type MeshState = {
+  status: Status
+  room: string
+  myName: string
+  messages: ChatMessage[]
+  error: string | null
+  localStream: MediaStream | null
+  remotePeers: RemotePeer[]
+  micOn: boolean
+  cameraOn: boolean
+}
+
+export const initialMeshState: MeshState = {
+  status: 'idle',
+  room: '',
+  myName: '',
+  messages: [],
+  error: null,
+  localStream: null,
+  remotePeers: [],
+  micOn: true,
+  cameraOn: true,
+}
+
+let messageCounter = 0
+function newMessageId(): string {
+  return `${Date.now()}-${messageCounter++}`
+}
+
+export class MeshClient {
+  /** Subscribe here to receive a new snapshot on every change. */
+  onChange: (state: MeshState) => void = () => {}
+
+  private state: MeshState = { ...initialMeshState }
+
+  // peer id -> Peer record. The heart of the mesh.
+  private peers = new Map<number, Peer>()
+  // Names learned from "joined"/"peer-joined" before a PC exists for that peer.
+  private names = new Map<number, string>()
+  private ws: WebSocket | null = null
+  private localStream: MediaStream | null = null
+
+  // --- state plumbing ---------------------------------------------------
+
+  private update(partial: Partial<MeshState>): void {
+    this.state = { ...this.state, ...partial }
+    this.onChange(this.state)
+  }
+
+  private addMessage(text: string, from: 'me' | 'peer', name?: string): void {
+    this.update({
+      messages: [...this.state.messages, { id: newMessageId(), text, from, name, at: Date.now() }],
+    })
+  }
+
+  // Publish the current remote video streams.
+  private syncRemotePeers(): void {
+    const remotePeers: RemotePeer[] = []
+    for (const [id, peer] of this.peers) {
+      const stream = (peer.pc as PcWithStream)._remoteStream
+      if (stream) remotePeers.push({ id, name: peer.name, stream, videoOn: peer.videoOn })
+    }
+    this.update({ remotePeers })
+  }
+
+  // Derive the single overall status from the aggregate of all peer states.
+  private recomputeStatus(): void {
+    const peers = [...this.peers.values()]
+    if (peers.length === 0) {
+      // Alone in the room — stay parked on the waiting screen so others can join.
+      const s = this.state.status
+      this.update({ status: s === 'idle' || s === 'failed' ? s : 'waiting' })
+      return
+    }
+    const states = peers.map((p) => p.pc.connectionState)
+    if (states.some((s) => s === 'connected')) this.update({ status: 'connected' })
+    else if (states.some((s) => s === 'failed')) this.update({ status: 'failed' })
+    else this.update({ status: 'connecting' })
+  }
+
+  // --- signaling --------------------------------------------------------
+
+  // Send a signaling payload to one specific peer via the relay.
+  private sendSignal(to: number, signal: Signal): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'signal', to, data: signal }))
+    }
+  }
+
+  // Wire up a data channel (created by the initiator, or received by the other).
+  private setupChannel(peerId: number, channel: RTCDataChannel): void {
+    const peer = this.peers.get(peerId)
+    if (peer) peer.channel = channel
+    channel.onopen = () => {
+      // Tell this peer our current camera state so they render us correctly.
+      channel.send(JSON.stringify({ kind: 'camera', on: this.state.cameraOn }))
+      this.recomputeStatus()
+    }
+    channel.onclose = () => this.recomputeStatus()
+    channel.onmessage = (e) => {
+      try {
+        const data = JSON.parse(String(e.data))
+        if (data.kind === 'camera') {
+          const p = this.peers.get(peerId)
+          if (p) p.videoOn = !!data.on
+          this.syncRemotePeers()
+        } else {
+          // chat (kind:'chat' or legacy {text,name})
+          this.addMessage(String(data.text), 'peer', data.name)
+        }
+      } catch {
+        this.addMessage(String(e.data), 'peer')
+      }
+    }
+  }
+
+  // Create (or return existing) peer connection toward a given participant.
+  private ensurePeer(peerId: number, name: string): Peer {
+    const existing = this.peers.get(peerId)
+    if (existing) return existing
+
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+    const peer: Peer = { pc, channel: null, pending: [], name, videoOn: true }
+    this.peers.set(peerId, peer)
+
+    // Trickle ICE: ship each candidate to *this* peer as it's found.
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        console.log(`%c[ICE] local candidate → peer ${peerId}`, 'color:#6ee7a8', e.candidate.candidate)
+        this.sendSignal(peerId, { kind: 'ice', candidate: e.candidate.toJSON() })
+      } else {
+        console.log(`%c[ICE] gathering complete for peer ${peerId}`, 'color:#ffd27a;font-weight:bold')
+      }
+    }
+
+    pc.onconnectionstatechange = () => {
+      console.log(`%c[PC ${peerId}] connection state: ${pc.connectionState}`, 'color:#4f8cff;font-weight:bold')
+      this.recomputeStatus()
+    }
+
+    // Remote audio + video tracks for this peer share one MediaStream.
+    // Camera on/off is signalled explicitly over the data channel (see
+    // setupChannel) — the remote track's `muted` flag is unreliable for this.
+    pc.ontrack = (e) => {
+      console.log(`%c[MEDIA] remote ${e.track.kind} from peer ${peerId}`, 'color:#6ee7a8;font-weight:bold')
+      ;(pc as PcWithStream)._remoteStream = e.streams[0]
+      this.syncRemotePeers()
+    }
+
+    // The non-initiator learns about the data channel here.
+    pc.ondatachannel = (e) => this.setupChannel(peerId, e.channel)
+
+    // Attach our local tracks so this peer receives our camera + mic.
+    const stream = this.localStream
+    if (stream) {
+      stream.getTracks().forEach((track) => {
+        const sender = pc.addTrack(track, stream)
+        // Steer video negotiation toward the GPU-accelerated H.264 encoder.
+        if (track.kind === 'video') {
+          const transceiver = pc.getTransceivers().find((t) => t.sender === sender)
+          if (transceiver) preferH264(transceiver)
+        }
+      })
+    }
+
+    return peer
+  }
+
+  private async flushCandidates(peer: Peer): Promise<void> {
+    for (const candidate of peer.pending) {
+      try {
+        await peer.pc.addIceCandidate(candidate)
+      } catch (err) {
+        console.warn('[ICE] failed to add queued candidate', err)
+      }
+    }
+    peer.pending = []
+  }
+
+  // Handle a signaling payload relayed from a specific peer.
+  private async handleSignal(from: number, signal: Signal): Promise<void> {
+    const name = this.names.get(from) ?? `Peer ${from}`
+    const peer = this.ensurePeer(from, name)
+    const pc = peer.pc
+
+    if (signal.kind === 'sdp') {
+      console.log(`%c[SDP] remote ${signal.description.type} from peer ${from}`, 'color:#a06bff;font-weight:bold')
+      await pc.setRemoteDescription(signal.description)
+      await this.flushCandidates(peer)
+
+      // If we received an offer, answer it.
+      if (signal.description.type === 'offer') {
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        console.log(`%c[SDP] local answer → peer ${from}`, 'color:#4f8cff;font-weight:bold')
+        this.sendSignal(from, { kind: 'sdp', description: { type: answer.type, sdp: answer.sdp } })
+      }
+    } else if (signal.kind === 'ice') {
+      // Can only add a candidate after the remote description exists.
+      if (pc.remoteDescription) {
+        try {
+          await pc.addIceCandidate(signal.candidate)
+        } catch (err) {
+          console.warn('[ICE] failed to add candidate', err)
+        }
+      } else {
+        peer.pending.push(signal.candidate)
+      }
+    }
+  }
+
+  // We were here first → initiate the offer toward a newcomer.
+  private async initiateTo(peerId: number, name: string): Promise<void> {
+    console.log(`%c[SIGNAL] peer ${peerId} joined — initiating offer`, 'color:#4f8cff;font-weight:bold')
+    const peer = this.ensurePeer(peerId, name)
+    const channel = peer.pc.createDataChannel('chat')
+    this.setupChannel(peerId, channel)
+    const offer = await peer.pc.createOffer()
+    await peer.pc.setLocalDescription(offer)
+    this.sendSignal(peerId, { kind: 'sdp', description: { type: offer.type, sdp: offer.sdp } })
+    this.update({ status: 'connecting' })
+  }
+
+  // Tear down a single peer (it left, or we're leaving).
+  private dropPeer(peerId: number): void {
+    const peer = this.peers.get(peerId)
+    if (!peer) return
+    peer.channel?.close()
+    peer.pc.close()
+    this.peers.delete(peerId)
+    this.names.delete(peerId)
+    this.syncRemotePeers()
+    this.recomputeStatus()
+  }
+
+  // Grab camera + mic ONCE; the same tracks are shared to every peer.
+  private async startLocalMedia(): Promise<void> {
+    const stream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS)
+    stream.getTracks().forEach((track) => {
+      console.groupCollapsed(`%c[MEDIA] local ${track.kind} track`, 'color:#4f8cff')
+      console.log('Constraints:', track.getConstraints())
+      console.log('Settings:', track.getSettings())
+      console.log('Capabilities:', track.getCapabilities?.())
+      console.groupEnd()
+    })
+    this.localStream = stream
+    this.update({ localStream: stream, micOn: true, cameraOn: true })
+  }
+
+  // --- public API -------------------------------------------------------
+
+  async joinRoom(roomId: string, name: string): Promise<void> {
+    const code = roomId.trim()
+    const displayName = name.trim()
+    if (!code || !displayName) return
+    try {
+      this.update({
+        error: null,
+        room: code,
+        myName: displayName,
+        messages: [],
+        remotePeers: [],
+        status: 'waiting',
+      })
+
+      // Capture media up front so tracks are present before any negotiation.
+      await this.startLocalMedia()
+
+      const ws = new WebSocket(signalingUrl())
+      this.ws = ws
+
+      ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room: code, name: displayName }))
+
+      ws.onmessage = async (ev) => {
+        const msg = JSON.parse(ev.data)
+        switch (msg.type) {
+          case 'joined': {
+            // The peers ALREADY here will each offer to us; we just wait.
+            const peers: { id: number; name: string }[] = msg.peers ?? []
+            console.log(`%c[SIGNAL] joined room '${code}' as id ${msg.you} (${peers.length} already here)`, 'color:#9aa3b2')
+            for (const p of peers) this.names.set(p.id, p.name)
+            this.update({ status: peers.length > 0 ? 'connecting' : 'waiting' })
+            break
+          }
+
+          case 'peer-joined': {
+            // We were here first → we initiate toward the newcomer.
+            this.names.set(msg.id, msg.name)
+            await this.initiateTo(msg.id, msg.name)
+            break
+          }
+
+          case 'signal':
+            await this.handleSignal(msg.from as number, msg.data as Signal)
+            break
+
+          case 'peer-left':
+            console.log(`%c[SIGNAL] peer ${msg.id} left`, 'color:#ff8a8a')
+            this.dropPeer(msg.id as number)
+            break
+
+          case 'error':
+            this.update({ error: msg.message ?? 'Signaling error', status: 'failed' })
+            break
+        }
+      }
+
+      ws.onerror = () => {
+        this.update({
+          error: 'Could not reach the signaling server. Is it running on port 9000?',
+          status: 'failed',
+        })
+      }
+    } catch (err) {
+      this.update({ error: (err as Error).message, status: 'failed' })
+    }
+  }
+
+  // Broadcast a chat message over every open data channel.
+  sendMessage(text: string): void {
+    const payload = JSON.stringify({ kind: 'chat', text, name: this.state.myName })
+    let sent = false
+    for (const peer of this.peers.values()) {
+      if (peer.channel && peer.channel.readyState === 'open') {
+        peer.channel.send(payload)
+        sent = true
+      }
+    }
+    if (sent) this.addMessage(text, 'me')
+  }
+
+  toggleMic(): void {
+    const stream = this.localStream
+    if (!stream) return
+    const next = !this.state.micOn
+    stream.getAudioTracks().forEach((t) => (t.enabled = next))
+    this.update({ micOn: next })
+  }
+
+  toggleCamera(): void {
+    const stream = this.localStream
+    if (!stream) return
+    const next = !this.state.cameraOn
+    stream.getVideoTracks().forEach((t) => (t.enabled = next))
+    this.update({ cameraOn: next })
+    // Let every peer know so they swap to/from our avatar.
+    const payload = JSON.stringify({ kind: 'camera', on: next })
+    for (const peer of this.peers.values()) {
+      if (peer.channel && peer.channel.readyState === 'open') peer.channel.send(payload)
+    }
+  }
+
+  leaveRoom(): void {
+    this.localStream?.getTracks().forEach((t) => t.stop())
+    for (const peer of this.peers.values()) {
+      peer.channel?.close()
+      peer.pc.close()
+    }
+    this.peers.clear()
+    this.names.clear()
+    this.ws?.close()
+    this.ws = null
+    this.localStream = null
+    this.update({ ...initialMeshState })
+  }
+}
