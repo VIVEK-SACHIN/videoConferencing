@@ -712,3 +712,29 @@ header h1 {
     min-height: 260px;
   }
 }
+
+/* In-call device settings popover */
+.fs-settings {
+  position: absolute;
+  bottom: 5.75rem;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(460px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 1rem;
+  background: rgba(22, 25, 32, 0.92);
+  backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+  z-index: 6;
+}
+.fs-settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}

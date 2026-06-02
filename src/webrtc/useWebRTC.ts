@@ -26,6 +26,9 @@ export function useWebRTC() {
       sendMessage: (text: string) => client.sendMessage(text),
       toggleMic: () => client.toggleMic(),
       toggleCamera: () => client.toggleCamera(),
+      switchCamera: (deviceId: string) => client.switchCamera(deviceId),
+      switchMicrophone: (deviceId: string) => client.switchMicrophone(deviceId),
+      setSpeaker: (deviceId: string) => client.setSpeaker(deviceId),
       leaveRoom: () => client.leaveRoom(),
     }
   }, [])

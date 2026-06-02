@@ -1,14 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { randomRoom } from '../utils/names'
+import { SINK_SUPPORTED, playTestTone } from '../utils/media'
 import type { DevicePrefs } from '../webrtc'
 import { Avatar } from './Avatar'
 import { Video } from './Video'
 
 type Device = { deviceId: string; label: string }
-
-// Selecting an output device is only meaningful where the browser supports it.
-const SINK_SUPPORTED =
-  typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype
 
 /** Small on/off pill switch (presentational). */
 function Switch({ on, onToggle }: { on: boolean; onToggle: () => void }) {
@@ -149,36 +146,6 @@ export function Lobby({
     setCamOn(next)
   }
 
-  // Play a short test tone through the selected output device.
-  async function playTestSound() {
-    try {
-      const ctx = new AudioContext()
-      const dest = ctx.createMediaStreamDestination()
-      const osc = ctx.createOscillator()
-      const gain = ctx.createGain()
-      osc.connect(gain)
-      gain.connect(dest)
-      osc.frequency.value = 440
-      gain.gain.setValueAtTime(0.0001, ctx.currentTime)
-      gain.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + 0.05)
-      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.4)
-
-      const audio = new Audio()
-      audio.srcObject = dest.stream
-      if (SINK_SUPPORTED && selectedSpeaker) {
-        await (audio as HTMLAudioElement & { setSinkId(id: string): Promise<void> }).setSinkId(
-          selectedSpeaker,
-        )
-      }
-      await audio.play()
-      osc.start()
-      osc.stop(ctx.currentTime + 0.4)
-      osc.onended = () => ctx.close()
-    } catch {
-      /* best-effort */
-    }
-  }
-
   function join() {
     if (!canJoin) return
     onJoin(roomInput.trim(), nameInput.trim(), {
@@ -287,7 +254,11 @@ export function Lobby({
                     </option>
                   ))}
               </select>
-              <button className="play-btn" title="Test speaker" onClick={playTestSound}>
+              <button
+                className="play-btn"
+                title="Test speaker"
+                onClick={() => playTestTone(selectedSpeaker)}
+              >
                 ▶
               </button>
             </div>

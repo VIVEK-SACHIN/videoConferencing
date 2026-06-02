@@ -29,6 +29,10 @@ type Peer = {
   name: string
   // Whether the peer is currently sending live video (camera on).
   videoOn: boolean
+  // Senders are kept so we can replaceTrack (switch device, or release/restore
+  // the camera) without renegotiation — even while the track is null.
+  audioSender: RTCRtpSender | null
+  videoSender: RTCRtpSender | null
 }
 
 /** A PeerConnection augmented with the remote stream captured from `ontrack`. */
@@ -45,6 +49,9 @@ export type MeshState = {
   remotePeers: RemotePeer[]
   micOn: boolean
   cameraOn: boolean
+  /** Currently active input devices (reflected by the in-call settings). */
+  micId: string | null
+  camId: string | null
   /** Chosen output device, applied to remote audio via setSinkId. */
   speakerId: string | null
 }
@@ -59,6 +66,8 @@ export const initialMeshState: MeshState = {
   remotePeers: [],
   micOn: true,
   cameraOn: true,
+  micId: null,
+  camId: null,
   speakerId: null,
 }
 
@@ -80,6 +89,10 @@ export class MeshClient {
   private ws: WebSocket | null = null
   private localStream: MediaStream | null = null
   private prefs: DevicePrefs = {}
+  // Guard against overlapping device switches (e.g. spamming the dropdown):
+  // one in-flight switch per kind, with the latest pending choice coalesced.
+  private switching: Record<'audio' | 'video', boolean> = { audio: false, video: false }
+  private pendingDevice: Partial<Record<'audio' | 'video', string>> = {}
 
   // --- state plumbing ---------------------------------------------------
 
@@ -161,7 +174,15 @@ export class MeshClient {
     if (existing) return existing
 
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
-    const peer: Peer = { pc, channel: null, pending: [], name, videoOn: true }
+    const peer: Peer = {
+      pc,
+      channel: null,
+      pending: [],
+      name,
+      videoOn: true,
+      audioSender: null,
+      videoSender: null,
+    }
     this.peers.set(peerId, peer)
 
     // Trickle ICE: ship each candidate to *this* peer as it's found.
@@ -191,17 +212,27 @@ export class MeshClient {
     // The non-initiator learns about the data channel here.
     pc.ondatachannel = (e) => this.setupChannel(peerId, e.channel)
 
-    // Attach our local tracks so this peer receives our camera + mic.
+    // Reserve audio + video senders up front. Keeping the senders (even with a
+    // null track when the camera is off) lets us switch devices and turn the
+    // camera on/off later via replaceTrack — no renegotiation, and it works for
+    // peers who join while our camera is off.
     const stream = this.localStream
     if (stream) {
-      stream.getTracks().forEach((track) => {
-        const sender = pc.addTrack(track, stream)
-        // Steer video negotiation toward the GPU-accelerated H.264 encoder.
-        if (track.kind === 'video') {
-          const transceiver = pc.getTransceivers().find((t) => t.sender === sender)
-          if (transceiver) preferH264(transceiver)
-        }
-      })
+      const audioTrack = stream.getAudioTracks()[0]
+      if (audioTrack) peer.audioSender = pc.addTrack(audioTrack, stream)
+
+      const videoTrack = stream.getVideoTracks()[0]
+      if (videoTrack) {
+        peer.videoSender = pc.addTrack(videoTrack, stream)
+        const tr = pc.getTransceivers().find((t) => t.sender === peer.videoSender)
+        if (tr) preferH264(tr)
+      } else {
+        // Camera off: reserve an empty video sender, tagging it with our stream
+        // id so the receiver groups the track when we later replaceTrack it in.
+        const tr = pc.addTransceiver('video', { direction: 'sendrecv', streams: [stream] })
+        peer.videoSender = tr.sender
+        preferH264(tr)
+      }
     }
 
     return peer
@@ -274,16 +305,27 @@ export class MeshClient {
     this.recomputeStatus()
   }
 
-  // Grab camera + mic ONCE; the same tracks are shared to every peer. Honour
-  // the devices chosen on the pre-join screen, falling back to the defaults.
+  // Build a video constraint for the currently chosen camera (the in-call
+  // selection if any, else the pre-join choice, else the default).
+  private videoConstraint(): MediaTrackConstraints {
+    const camId = this.state.camId ?? this.prefs.camId
+    return camId
+      ? { ...(MEDIA_CONSTRAINTS.video as MediaTrackConstraints), deviceId: { exact: camId } }
+      : (MEDIA_CONSTRAINTS.video as MediaTrackConstraints)
+  }
+
+  // Grab mic (always) + camera (only if joining with it on). Honour the devices
+  // chosen on the pre-join screen, falling back to the defaults. Leaving the
+  // camera off means we never open it — no capture, no indicator light.
   private async startLocalMedia(): Promise<void> {
+    const micOn = this.prefs.micOn !== false
+    const cameraOn = this.prefs.camOn !== false
+
     const constraints: MediaStreamConstraints = {
-      video: this.prefs.camId
-        ? { ...(MEDIA_CONSTRAINTS.video as MediaTrackConstraints), deviceId: { exact: this.prefs.camId } }
-        : MEDIA_CONSTRAINTS.video,
       audio: this.prefs.micId
         ? { ...(MEDIA_CONSTRAINTS.audio as MediaTrackConstraints), deviceId: { exact: this.prefs.micId } }
         : MEDIA_CONSTRAINTS.audio,
+      video: cameraOn ? this.videoConstraint() : false,
     }
     const stream = await navigator.mediaDevices.getUserMedia(constraints)
     stream.getTracks().forEach((track) => {
@@ -294,16 +336,19 @@ export class MeshClient {
       console.groupEnd()
     })
 
-    // Honour the pre-join mic/camera choice. We always *capture* both tracks
-    // (so they're negotiated up front) but start them disabled if requested —
-    // toggling on later is then just `enabled = true`, no renegotiation.
-    const micOn = this.prefs.micOn !== false
-    const cameraOn = this.prefs.camOn !== false
+    // The mic is always captured (so unmuting is instant); it just starts
+    // disabled if requested. The camera, by contrast, isn't even opened above
+    // when off.
     stream.getAudioTracks().forEach((t) => (t.enabled = micOn))
-    stream.getVideoTracks().forEach((t) => (t.enabled = cameraOn))
 
     this.localStream = stream
-    this.update({ localStream: stream, micOn, cameraOn })
+    this.update({
+      localStream: stream,
+      micOn,
+      cameraOn,
+      micId: this.prefs.micId ?? stream.getAudioTracks()[0]?.getSettings().deviceId ?? null,
+      camId: this.prefs.camId ?? stream.getVideoTracks()[0]?.getSettings().deviceId ?? null,
+    })
   }
 
   // --- public API -------------------------------------------------------
@@ -398,17 +443,125 @@ export class MeshClient {
     this.update({ micOn: next })
   }
 
-  toggleCamera(): void {
-    const stream = this.localStream
-    if (!stream) return
-    const next = !this.state.cameraOn
-    stream.getVideoTracks().forEach((t) => (t.enabled = next))
-    this.update({ cameraOn: next })
-    // Let every peer know so they swap to/from our avatar.
-    const payload = JSON.stringify({ kind: 'camera', on: next })
+  // Tell every peer our camera state so they swap to/from our avatar.
+  private broadcastCamera(on: boolean): void {
+    const payload = JSON.stringify({ kind: 'camera', on })
     for (const peer of this.peers.values()) {
       if (peer.channel && peer.channel.readyState === 'open') peer.channel.send(payload)
     }
+  }
+
+  /**
+   * Turn the camera fully off (release the device — light goes out) or back on.
+   * Off detaches the track from every reserved video sender and stops it; on
+   * re-opens the camera and re-attaches via replaceTrack — no renegotiation.
+   */
+  async toggleCamera(): Promise<void> {
+    const stream = this.localStream
+    if (!stream) return
+    const turnOn = !this.state.cameraOn
+
+    if (turnOn) {
+      let track: MediaStreamTrack | undefined
+      try {
+        const tmp = await navigator.mediaDevices.getUserMedia({ video: this.videoConstraint() })
+        track = tmp.getVideoTracks()[0]
+      } catch (err) {
+        console.warn('[CAMERA] could not start camera', err)
+        return
+      }
+      if (!track) return
+      for (const peer of this.peers.values()) {
+        if (peer.videoSender) await peer.videoSender.replaceTrack(track)
+      }
+      stream.addTrack(track)
+      this.update({ cameraOn: true, camId: track.getSettings().deviceId ?? this.state.camId })
+    } else {
+      for (const peer of this.peers.values()) {
+        if (peer.videoSender) await peer.videoSender.replaceTrack(null)
+      }
+      const old = stream.getVideoTracks()[0]
+      if (old) {
+        stream.removeTrack(old)
+        old.stop()
+      }
+      this.update({ cameraOn: false })
+    }
+
+    this.broadcastCamera(turnOn)
+  }
+
+  /**
+   * Swap the active camera or microphone mid-call. Captures a fresh track from
+   * the chosen device and `replaceTrack`s it on every peer's reserved sender —
+   * no SDP renegotiation needed. The current on/off state is preserved.
+   *
+   * Overlapping calls (e.g. spamming the dropdown) are coalesced: only one
+   * switch per kind runs at a time, and the latest pending choice is applied
+   * afterwards, so we never double-capture or leave senders inconsistent.
+   */
+  private async switchTrack(kind: 'audio' | 'video', deviceId: string): Promise<void> {
+    if (this.switching[kind]) {
+      this.pendingDevice[kind] = deviceId
+      return
+    }
+    this.switching[kind] = true
+    try {
+      const stream = this.localStream
+      if (!stream) return
+
+      // Choosing a camera while it's off just records the choice; the device is
+      // opened when the camera is turned back on (so we don't power it up here).
+      if (kind === 'video' && !this.state.cameraOn) {
+        this.update({ camId: deviceId })
+        return
+      }
+
+      const constraints: MediaStreamConstraints =
+        kind === 'video'
+          ? { video: { ...(MEDIA_CONSTRAINTS.video as MediaTrackConstraints), deviceId: { exact: deviceId } } }
+          : { audio: { ...(MEDIA_CONSTRAINTS.audio as MediaTrackConstraints), deviceId: { exact: deviceId } } }
+      const tmp = await navigator.mediaDevices.getUserMedia(constraints)
+      const next = kind === 'video' ? tmp.getVideoTracks()[0] : tmp.getAudioTracks()[0]
+      if (!next) return
+      next.enabled = kind === 'video' ? this.state.cameraOn : this.state.micOn
+
+      // Point every peer's reserved sender at the new track.
+      for (const peer of this.peers.values()) {
+        const sender = kind === 'video' ? peer.videoSender : peer.audioSender
+        if (sender) await sender.replaceTrack(next)
+      }
+
+      // Swap it into the local stream too (drives our own preview tile).
+      const old = kind === 'video' ? stream.getVideoTracks()[0] : stream.getAudioTracks()[0]
+      if (old) {
+        stream.removeTrack(old)
+        old.stop()
+      }
+      stream.addTrack(next)
+
+      this.update(kind === 'video' ? { camId: deviceId } : { micId: deviceId })
+    } catch (err) {
+      console.warn(`[DEVICE] could not switch ${kind}`, err)
+    } finally {
+      this.switching[kind] = false
+      const queued = this.pendingDevice[kind]
+      this.pendingDevice[kind] = undefined
+      if (queued !== undefined && queued !== deviceId) void this.switchTrack(kind, queued)
+    }
+  }
+
+  switchCamera(deviceId: string): Promise<void> {
+    return this.switchTrack('video', deviceId)
+  }
+
+  switchMicrophone(deviceId: string): Promise<void> {
+    return this.switchTrack('audio', deviceId)
+  }
+
+  /** Route remote audio to a different output device (where supported). */
+  setSpeaker(deviceId: string): void {
+    this.update({ speakerId: deviceId })
   }
 
   leaveRoom(): void {
