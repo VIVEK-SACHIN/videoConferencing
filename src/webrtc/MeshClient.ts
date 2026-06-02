@@ -33,10 +33,18 @@ type Peer = {
   // the camera) without renegotiation — even while the track is null.
   audioSender: RTCRtpSender | null
   videoSender: RTCRtpSender | null
+  // Sender carrying our screen track to this peer while we present.
+  screenSender: RTCRtpSender | null
+  // Perfect-negotiation state (handles offer glare during renegotiation).
+  polite: boolean
+  makingOffer: boolean
+  ignoreOffer: boolean
+  // Remote streams from this peer keyed by id (camera + optional screen).
+  streams: Map<string, MediaStream>
+  // Stream id this peer designated as their screen share, via the data channel.
+  screenId: string | null
 }
 
-/** A PeerConnection augmented with the remote stream captured from `ontrack`. */
-type PcWithStream = RTCPeerConnection & { _remoteStream?: MediaStream }
 
 /** The observable snapshot the UI renders from. */
 export type MeshState = {
@@ -54,6 +62,14 @@ export type MeshState = {
   camId: string | null
   /** Chosen output device, applied to remote audio via setSinkId. */
   speakerId: string | null
+  /** Our own server-assigned id (known once joined). */
+  myId: number | null
+  /** Id of the participant currently presenting, or null. */
+  presenterId: number | null
+  /** Our own screen-share stream while we present (drives the big view). */
+  localScreenStream: MediaStream | null
+  /** CaptureController for our active tab capture (Captured Surface Control). */
+  screenController: CaptureController | null
 }
 
 export const initialMeshState: MeshState = {
@@ -69,6 +85,10 @@ export const initialMeshState: MeshState = {
   micId: null,
   camId: null,
   speakerId: null,
+  myId: null,
+  presenterId: null,
+  localScreenStream: null,
+  screenController: null,
 }
 
 let messageCounter = 0
@@ -107,12 +127,15 @@ export class MeshClient {
     })
   }
 
-  // Publish the current remote video streams.
+  // Publish the current remote streams. A peer may expose two streams (camera
+  // + screen); the screen is the one whose id the peer announced over the data
+  // channel, the camera is the other.
   private syncRemotePeers(): void {
     const remotePeers: RemotePeer[] = []
     for (const [id, peer] of this.peers) {
-      const stream = (peer.pc as PcWithStream)._remoteStream
-      if (stream) remotePeers.push({ id, name: peer.name, stream, videoOn: peer.videoOn })
+      const screenStream = peer.screenId ? peer.streams.get(peer.screenId) ?? null : null
+      const stream = [...peer.streams.values()].find((s) => s.id !== peer.screenId) ?? null
+      remotePeers.push({ id, name: peer.name, stream, videoOn: peer.videoOn, screenStream })
     }
     this.update({ remotePeers })
   }
@@ -148,6 +171,10 @@ export class MeshClient {
     channel.onopen = () => {
       // Tell this peer our current camera state so they render us correctly.
       channel.send(JSON.stringify({ kind: 'camera', on: this.state.cameraOn }))
+      // If we're already presenting, let this (possibly late) peer know.
+      if (this.state.presenterId === this.state.myId && this.state.localScreenStream) {
+        channel.send(JSON.stringify({ kind: 'present', on: true, streamId: this.state.localScreenStream.id }))
+      }
       this.recomputeStatus()
     }
     channel.onclose = () => this.recomputeStatus()
@@ -157,6 +184,13 @@ export class MeshClient {
         if (data.kind === 'camera') {
           const p = this.peers.get(peerId)
           if (p) p.videoOn = !!data.on
+          this.syncRemotePeers()
+        } else if (data.kind === 'present') {
+          const p = this.peers.get(peerId)
+          if (p) p.screenId = data.on ? String(data.streamId) : null
+          this.update({
+            presenterId: data.on ? peerId : this.state.presenterId === peerId ? null : this.state.presenterId,
+          })
           this.syncRemotePeers()
         } else {
           // chat (kind:'chat' or legacy {text,name})
@@ -182,6 +216,13 @@ export class MeshClient {
       videoOn: true,
       audioSender: null,
       videoSender: null,
+      screenSender: null,
+      // Deterministic, opposite on each side of the pair → glare-free.
+      polite: this.state.myId != null ? this.state.myId > peerId : false,
+      makingOffer: false,
+      ignoreOffer: false,
+      streams: new Map(),
+      screenId: null,
     }
     this.peers.set(peerId, peer)
 
@@ -195,17 +236,37 @@ export class MeshClient {
       }
     }
 
+    // Perfect negotiation: any track add/remove (initial setup, screen share)
+    // fires this; we create an offer guarded by makingOffer so glare is safe.
+    pc.onnegotiationneeded = async () => {
+      try {
+        peer.makingOffer = true
+        await pc.setLocalDescription()
+        if (pc.localDescription) {
+          this.sendSignal(peerId, {
+            kind: 'sdp',
+            description: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+          })
+        }
+      } catch (err) {
+        console.warn(`[NEG] negotiation failed for peer ${peerId}`, err)
+      } finally {
+        peer.makingOffer = false
+      }
+    }
+
     pc.onconnectionstatechange = () => {
       console.log(`%c[PC ${peerId}] connection state: ${pc.connectionState}`, 'color:#4f8cff;font-weight:bold')
       this.recomputeStatus()
     }
 
-    // Remote audio + video tracks for this peer share one MediaStream.
-    // Camera on/off is signalled explicitly over the data channel (see
-    // setupChannel) — the remote track's `muted` flag is unreliable for this.
+    // Track remote streams by id; a peer may expose camera + screen. Camera
+    // on/off is signalled over the data channel (the track's `muted` flag is
+    // unreliable), and which stream is the screen is announced there too.
     pc.ontrack = (e) => {
       console.log(`%c[MEDIA] remote ${e.track.kind} from peer ${peerId}`, 'color:#6ee7a8;font-weight:bold')
-      ;(pc as PcWithStream)._remoteStream = e.streams[0]
+      const stream = e.streams[0]
+      if (stream) peer.streams.set(stream.id, stream)
       this.syncRemotePeers()
     }
 
@@ -249,23 +310,33 @@ export class MeshClient {
     peer.pending = []
   }
 
-  // Handle a signaling payload relayed from a specific peer.
+  // Handle a signaling payload relayed from a specific peer, using the perfect-
+  // negotiation pattern so renegotiation (screen share) can't deadlock on glare.
   private async handleSignal(from: number, signal: Signal): Promise<void> {
     const name = this.names.get(from) ?? `Peer ${from}`
     const peer = this.ensurePeer(from, name)
     const pc = peer.pc
 
     if (signal.kind === 'sdp') {
-      console.log(`%c[SDP] remote ${signal.description.type} from peer ${from}`, 'color:#a06bff;font-weight:bold')
-      await pc.setRemoteDescription(signal.description)
+      const desc = signal.description
+      console.log(`%c[SDP] remote ${desc.type} from peer ${from}`, 'color:#a06bff;font-weight:bold')
+      const collision = desc.type === 'offer' && (peer.makingOffer || pc.signalingState !== 'stable')
+      peer.ignoreOffer = !peer.polite && collision
+      if (peer.ignoreOffer) {
+        console.log(`%c[NEG] ignoring colliding offer from peer ${from} (impolite)`, 'color:#ff8a8a')
+        return
+      }
+      await pc.setRemoteDescription(desc) // implicit rollback on polite collision
       await this.flushCandidates(peer)
-
-      // If we received an offer, answer it.
-      if (signal.description.type === 'offer') {
-        const answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-        console.log(`%c[SDP] local answer → peer ${from}`, 'color:#4f8cff;font-weight:bold')
-        this.sendSignal(from, { kind: 'sdp', description: { type: answer.type, sdp: answer.sdp } })
+      if (desc.type === 'offer') {
+        await pc.setLocalDescription() // implicit answer
+        if (pc.localDescription) {
+          console.log(`%c[SDP] local answer → peer ${from}`, 'color:#4f8cff;font-weight:bold')
+          this.sendSignal(from, {
+            kind: 'sdp',
+            description: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+          })
+        }
       }
     } else if (signal.kind === 'ice') {
       // Can only add a candidate after the remote description exists.
@@ -273,7 +344,7 @@ export class MeshClient {
         try {
           await pc.addIceCandidate(signal.candidate)
         } catch (err) {
-          console.warn('[ICE] failed to add candidate', err)
+          if (!peer.ignoreOffer) console.warn('[ICE] failed to add candidate', err)
         }
       } else {
         peer.pending.push(signal.candidate)
@@ -281,15 +352,14 @@ export class MeshClient {
     }
   }
 
-  // We were here first → initiate the offer toward a newcomer.
-  private async initiateTo(peerId: number, name: string): Promise<void> {
-    console.log(`%c[SIGNAL] peer ${peerId} joined — initiating offer`, 'color:#4f8cff;font-weight:bold')
+  // We were here first → kick off the connection to a newcomer. Creating the
+  // data channel (plus the tracks added in ensurePeer) triggers
+  // onnegotiationneeded, which produces the initial offer.
+  private initiateTo(peerId: number, name: string): void {
+    console.log(`%c[SIGNAL] peer ${peerId} joined — initiating`, 'color:#4f8cff;font-weight:bold')
     const peer = this.ensurePeer(peerId, name)
     const channel = peer.pc.createDataChannel('chat')
     this.setupChannel(peerId, channel)
-    const offer = await peer.pc.createOffer()
-    await peer.pc.setLocalDescription(offer)
-    this.sendSignal(peerId, { kind: 'sdp', description: { type: offer.type, sdp: offer.sdp } })
     this.update({ status: 'connecting' })
   }
 
@@ -301,6 +371,9 @@ export class MeshClient {
     peer.pc.close()
     this.peers.delete(peerId)
     this.names.delete(peerId)
+    // If the leaver was presenting, drop back to the normal grid.
+    const presenterId = this.state.presenterId === peerId ? null : this.state.presenterId
+    this.update({ presenterId })
     this.syncRemotePeers()
     this.recomputeStatus()
   }
@@ -385,14 +458,14 @@ export class MeshClient {
             const peers: { id: number; name: string }[] = msg.peers ?? []
             console.log(`%c[SIGNAL] joined room '${code}' as id ${msg.you} (${peers.length} already here)`, 'color:#9aa3b2')
             for (const p of peers) this.names.set(p.id, p.name)
-            this.update({ status: peers.length > 0 ? 'connecting' : 'waiting' })
+            this.update({ myId: msg.you, status: peers.length > 0 ? 'connecting' : 'waiting' })
             break
           }
 
           case 'peer-joined': {
             // We were here first → we initiate toward the newcomer.
             this.names.set(msg.id, msg.name)
-            await this.initiateTo(msg.id, msg.name)
+            this.initiateTo(msg.id, msg.name)
             break
           }
 
@@ -564,7 +637,70 @@ export class MeshClient {
     this.update({ speakerId: deviceId })
   }
 
+  // Tell every peer whether we're presenting (and which stream is the screen).
+  private broadcastPresent(on: boolean, streamId?: string): void {
+    const payload = JSON.stringify({ kind: 'present', on, streamId })
+    for (const peer of this.peers.values()) {
+      if (peer.channel && peer.channel.readyState === 'open') peer.channel.send(payload)
+    }
+  }
+
+  /**
+   * Start sharing the screen. The screen is added as a *separate* track to each
+   * peer (so the camera keeps flowing), which renegotiates via perfect
+   * negotiation. A CaptureController is attached for Captured Surface Control.
+   * Only one participant may present at a time.
+   */
+  async startScreenShare(): Promise<void> {
+    if (this.state.presenterId != null && this.state.presenterId !== this.state.myId) return
+    if (this.state.localScreenStream) return
+    let stream: MediaStream
+    const controller =
+      typeof window !== 'undefined' && window.CaptureController ? new CaptureController() : undefined
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false, controller })
+    } catch (err) {
+      console.warn('[SCREEN] share cancelled/failed', err)
+      return
+    }
+    const track = stream.getVideoTracks()[0]
+    if (!track) return
+    // The browser's own "Stop sharing" control ends the track.
+    track.onended = () => void this.stopScreenShare()
+
+    for (const peer of this.peers.values()) {
+      peer.screenSender = peer.pc.addTrack(track, stream) // → onnegotiationneeded
+    }
+
+    this.update({
+      presenterId: this.state.myId,
+      localScreenStream: stream,
+      screenController: controller ?? null,
+    })
+    this.broadcastPresent(true, stream.id)
+  }
+
+  /** Stop our screen share and revert everyone to the normal grid. */
+  async stopScreenShare(): Promise<void> {
+    if (!this.state.localScreenStream) return
+    for (const peer of this.peers.values()) {
+      if (peer.screenSender) {
+        peer.pc.removeTrack(peer.screenSender) // → onnegotiationneeded
+        peer.screenSender = null
+      }
+    }
+    this.state.localScreenStream.getTracks().forEach((t) => t.stop())
+    this.update({
+      presenterId: this.state.presenterId === this.state.myId ? null : this.state.presenterId,
+      localScreenStream: null,
+      screenController: null,
+    })
+    this.broadcastPresent(false)
+  }
+
   leaveRoom(): void {
+    this.state.localScreenStream?.getTracks().forEach((t) => t.stop())
+    this.localStream?.getTracks().forEach((t) => t.stop())
     this.localStream?.getTracks().forEach((t) => t.stop())
     for (const peer of this.peers.values()) {
       peer.channel?.close()

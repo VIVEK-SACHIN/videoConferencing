@@ -29,6 +29,8 @@ export function useWebRTC() {
       switchCamera: (deviceId: string) => client.switchCamera(deviceId),
       switchMicrophone: (deviceId: string) => client.switchMicrophone(deviceId),
       setSpeaker: (deviceId: string) => client.setSpeaker(deviceId),
+      startScreenShare: () => client.startScreenShare(),
+      stopScreenShare: () => client.stopScreenShare(),
       leaveRoom: () => client.leaveRoom(),
     }
   }, [])

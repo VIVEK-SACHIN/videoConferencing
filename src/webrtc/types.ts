@@ -21,9 +21,12 @@ export type Status =
 export type RemotePeer = {
   id: number
   name: string
-  stream: MediaStream
+  /** Camera stream; null when the peer has no camera track (e.g. camera off). */
+  stream: MediaStream | null
   /** False when the peer's camera is off (show an avatar instead). */
   videoOn: boolean
+  /** Screen-share stream when this peer is presenting, else null. */
+  screenStream: MediaStream | null
 }
 
 /** Devices + initial state chosen on the pre-join screen, handed to the call. */
