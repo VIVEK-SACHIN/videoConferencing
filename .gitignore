@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-ssr
+*.local
+
+# Self-signed TLS certs for local HTTPS dev — never commit private keys
+certs/
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+server/target/
