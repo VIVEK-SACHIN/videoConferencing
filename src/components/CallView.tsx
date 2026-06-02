@@ -24,6 +24,7 @@ export function CallView({ rtc }: { rtc: UseWebRTC }) {
         cameraOn={rtc.cameraOn}
         remotePeers={rtc.remotePeers}
         chatOpen={chatOpen}
+        speakerId={rtc.speakerId}
       />
 
       <div className="fs-topbar">

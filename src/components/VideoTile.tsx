@@ -10,17 +10,21 @@ export function VideoTile({
   name,
   videoOn,
   self = false,
+  sinkId,
 }: {
   stream: MediaStream | null
   name: string
   videoOn: boolean
   self?: boolean
+  /** Output device for this tile's audio (remote tiles only). */
+  sinkId?: string | null
 }) {
   return (
     <div className="tile">
       <Video
         stream={stream}
         muted={self}
+        sinkId={self ? undefined : sinkId}
         className={self ? 'tile-video tile-video-mirror' : 'tile-video'}
       />
       {!videoOn && <Avatar name={name} />}

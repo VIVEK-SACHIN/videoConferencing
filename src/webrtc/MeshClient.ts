@@ -1,6 +1,6 @@
 import { ICE_SERVERS, MEDIA_CONSTRAINTS, signalingUrl } from './config'
 import { preferH264 } from './codec'
-import type { ChatMessage, RemotePeer, Signal, Status } from './types'
+import type { ChatMessage, DevicePrefs, RemotePeer, Signal, Status } from './types'
 
 /**
  * Framework-agnostic WebRTC **mesh** client.
@@ -45,6 +45,8 @@ export type MeshState = {
   remotePeers: RemotePeer[]
   micOn: boolean
   cameraOn: boolean
+  /** Chosen output device, applied to remote audio via setSinkId. */
+  speakerId: string | null
 }
 
 export const initialMeshState: MeshState = {
@@ -57,6 +59,7 @@ export const initialMeshState: MeshState = {
   remotePeers: [],
   micOn: true,
   cameraOn: true,
+  speakerId: null,
 }
 
 let messageCounter = 0
@@ -76,6 +79,7 @@ export class MeshClient {
   private names = new Map<number, string>()
   private ws: WebSocket | null = null
   private localStream: MediaStream | null = null
+  private prefs: DevicePrefs = {}
 
   // --- state plumbing ---------------------------------------------------
 
@@ -270,9 +274,18 @@ export class MeshClient {
     this.recomputeStatus()
   }
 
-  // Grab camera + mic ONCE; the same tracks are shared to every peer.
+  // Grab camera + mic ONCE; the same tracks are shared to every peer. Honour
+  // the devices chosen on the pre-join screen, falling back to the defaults.
   private async startLocalMedia(): Promise<void> {
-    const stream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS)
+    const constraints: MediaStreamConstraints = {
+      video: this.prefs.camId
+        ? { ...(MEDIA_CONSTRAINTS.video as MediaTrackConstraints), deviceId: { exact: this.prefs.camId } }
+        : MEDIA_CONSTRAINTS.video,
+      audio: this.prefs.micId
+        ? { ...(MEDIA_CONSTRAINTS.audio as MediaTrackConstraints), deviceId: { exact: this.prefs.micId } }
+        : MEDIA_CONSTRAINTS.audio,
+    }
+    const stream = await navigator.mediaDevices.getUserMedia(constraints)
     stream.getTracks().forEach((track) => {
       console.groupCollapsed(`%c[MEDIA] local ${track.kind} track`, 'color:#4f8cff')
       console.log('Constraints:', track.getConstraints())
@@ -280,16 +293,26 @@ export class MeshClient {
       console.log('Capabilities:', track.getCapabilities?.())
       console.groupEnd()
     })
+
+    // Honour the pre-join mic/camera choice. We always *capture* both tracks
+    // (so they're negotiated up front) but start them disabled if requested —
+    // toggling on later is then just `enabled = true`, no renegotiation.
+    const micOn = this.prefs.micOn !== false
+    const cameraOn = this.prefs.camOn !== false
+    stream.getAudioTracks().forEach((t) => (t.enabled = micOn))
+    stream.getVideoTracks().forEach((t) => (t.enabled = cameraOn))
+
     this.localStream = stream
-    this.update({ localStream: stream, micOn: true, cameraOn: true })
+    this.update({ localStream: stream, micOn, cameraOn })
   }
 
   // --- public API -------------------------------------------------------
 
-  async joinRoom(roomId: string, name: string): Promise<void> {
+  async joinRoom(roomId: string, name: string, prefs: DevicePrefs = {}): Promise<void> {
     const code = roomId.trim()
     const displayName = name.trim()
     if (!code || !displayName) return
+    this.prefs = prefs
     try {
       this.update({
         error: null,
@@ -298,6 +321,7 @@ export class MeshClient {
         messages: [],
         remotePeers: [],
         status: 'waiting',
+        speakerId: prefs.speakerId ?? null,
       })
 
       // Capture media up front so tracks are present before any negotiation.

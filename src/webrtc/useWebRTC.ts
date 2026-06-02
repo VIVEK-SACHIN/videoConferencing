@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { MeshClient, initialMeshState, type MeshState } from './MeshClient'
+import type { DevicePrefs } from './types'
 
 /**
  * React binding for {@link MeshClient}. The client owns all the WebRTC logic;
@@ -20,7 +21,8 @@ export function useWebRTC() {
   const actions = useMemo(() => {
     const client = clientRef.current!
     return {
-      joinRoom: (room: string, name: string) => client.joinRoom(room, name),
+      joinRoom: (room: string, name: string, devices: DevicePrefs = {}) =>
+        client.joinRoom(room, name, devices),
       sendMessage: (text: string) => client.sendMessage(text),
       toggleMic: () => client.toggleMic(),
       toggleCamera: () => client.toggleCamera(),

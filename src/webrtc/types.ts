@@ -26,6 +26,19 @@ export type RemotePeer = {
   videoOn: boolean
 }
 
+/** Devices + initial state chosen on the pre-join screen, handed to the call. */
+export type DevicePrefs = {
+  micId?: string
+  camId?: string
+  /** Output device id; only honoured where HTMLMediaElement.setSinkId exists. */
+  speakerId?: string
+  /** Start the call with the mic on? Defaults to true. */
+  micOn?: boolean
+  /** Start the call with the camera on? Defaults to true. The track is still
+   *  captured (just disabled) so it can be turned on later without renegotiation. */
+  camOn?: boolean
+}
+
 // Signal payloads we send through the relay (wrapped in {type:'signal',to,data}).
 export type SdpSignal = { kind: 'sdp'; description: RTCSessionDescriptionInit }
 export type IceSignal = { kind: 'ice'; candidate: RTCIceCandidateInit }
