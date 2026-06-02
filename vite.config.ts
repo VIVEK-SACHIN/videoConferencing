@@ -11,7 +11,7 @@ const cert = (name: string) =>
 export default defineConfig({
   plugins: [react()],
 
-  // base: '/videoConferencing/',
+  base: '/videoConferencing/',
 
   server: {
     // Listen on all interfaces so other devices on the LAN can reach it.
