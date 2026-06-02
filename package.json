@@ -5,15 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host",
-    "server": "cargo run --manifest-path server/Cargo.toml",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "predeploy": "npm run build",
+    "deploy": "gh-pages -d dist"
   },
   "dependencies": {
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "predeploy": "npm run build",
-    "deploy": "gh-pages -d dist"
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
