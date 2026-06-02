@@ -35,6 +35,7 @@ export const MEDIA_CONSTRAINTS: MediaStreamConstraints = {
 // signaling server. Using the same origin (wss + current host) means the
 // browser reuses the TLS cert it already trusts — no extra cert prompt.
 export function signalingUrl(): string {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-  return `${proto}://${location.host}/ws`
+  return "https://rusttourback.onrender.com/ws";
+  // const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  // return `${proto}://${location.host}/ws`
 }

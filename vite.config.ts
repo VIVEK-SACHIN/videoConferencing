@@ -11,7 +11,7 @@ const cert = (name: string) =>
 export default defineConfig({
   plugins: [react()],
 
-  base: '/videoConferencing/',
+  // base: '/videoConferencing/',
 
   server: {
     // Listen on all interfaces so other devices on the LAN can reach it.
@@ -27,13 +27,13 @@ export default defineConfig({
     // wss://<this-host>/ws (cert already trusted), and Vite forwards it as plain
     // ws:// to the local Rust server — so we don't need TLS in Rust or a second
     // cert-acceptance step on port 3000.
-    proxy: {
-      '/ws': {
-        target: 'ws://localhost:3000',
-        ws: true,
-        changeOrigin: true,
-      },
-    },
+    // proxy: {
+    //   '/ws': {
+    //     target: 'wss://rusttourback.onrender.com/',
+    //     ws: true,
+    //     changeOrigin: true,
+    //   },
+    // },
   },
 
   build: {
