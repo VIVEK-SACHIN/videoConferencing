@@ -486,7 +486,7 @@ export class MeshClient {
 
       ws.onerror = () => {
         this.update({
-          error: 'Could not reach the signaling server. Is it running on port 9000?',
+          error: 'Could not reach the signaling server. Is it running on port 3000?',
           status: 'failed',
         })
       }

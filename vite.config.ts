@@ -24,10 +24,10 @@ export default defineConfig({
     // Proxy the signaling WebSocket to the Rust server. The browser connects to
     // wss://<this-host>/ws (cert already trusted), and Vite forwards it as plain
     // ws:// to the local Rust server — so we don't need TLS in Rust or a second
-    // cert-acceptance step on port 9000.
+    // cert-acceptance step on port 3000.
     proxy: {
       '/ws': {
-        target: 'ws://localhost:9000',
+        target: 'ws://localhost:3000',
         ws: true,
         changeOrigin: true,
       },
